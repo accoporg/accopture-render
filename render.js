@@ -147,10 +147,12 @@ function buildResourceProfile(memMb) {
 }
 
 const RES = buildResourceProfile(MEM_LIMIT_MB);
+const WS_SEND_CHUNK = Math.max(RES.maxChunk, MEM_LIMIT_MB <= 128 ? 32768 : 65536);
 const OOM_SOFT_BYTES = Math.floor(MEM_LIMIT_BYTES * 0.80);
 const OOM_HARD_BYTES = Math.floor(MEM_LIMIT_BYTES * 0.88);
 let memoryPressureActive = false;
 let lastMemWarnAt = 0;
+let lastGcAt = 0;
 
 function trimBoundedMap(map, maxEntries) {
   if (map.size <= maxEntries) return;
@@ -164,25 +166,27 @@ function trimBoundedMap(map, maxEntries) {
 }
 
 function checkMemoryPressure() {
+  const now = Date.now();
   const rss = process.memoryUsage().rss;
   if (rss >= OOM_SOFT_BYTES) {
     trimBoundedMap(dnsCache, Math.floor(RES.maxCacheEntries / 2));
     trimBoundedMap(tokenCache, Math.floor(RES.maxCacheEntries / 2));
-    if (typeof global.gc === 'function') {
+    if (typeof global.gc === 'function' && now - lastGcAt >= 60000) {
+      lastGcAt = now;
       try { global.gc(); } catch {}
     }
   }
   const afterRss = process.memoryUsage().rss;
   const wasActive = memoryPressureActive;
   memoryPressureActive = afterRss >= OOM_HARD_BYTES;
-  if (memoryPressureActive && (!wasActive || Date.now() - lastMemWarnAt > 30000)) {
-    lastMemWarnAt = Date.now();
+  if (memoryPressureActive && (!wasActive || now - lastMemWarnAt > 30000)) {
+    lastMemWarnAt = now;
     log('SYS', null, `Memory pressure guard active: RSS ${(afterRss / 1048576).toFixed(1)}/${MEM_LIMIT_MB}MB (pausing new upgrades)`);
   }
   return memoryPressureActive;
 }
 
-setInterval(checkMemoryPressure, 5000).unref();
+setInterval(checkMemoryPressure, 10000).unref();
 
 
 const PORT = Number(process.env.PORT || process.env.SERVER_PORT || 10000);
@@ -251,9 +255,11 @@ function decrementTokenConns(token) {
   else activeTokenConns.set(token, cur);
 }
 
+let approxNow = Date.now();
+setInterval(() => { approxNow = Date.now(); }, 1000).unref();
+
 function recordTraffic(ws, dir, bytes) {
   if (!bytes || bytes <= 0) return;
-  const now = Date.now();
   if (dir === 'tx') {
     nodeMetrics.txDelta += bytes;
     if (ws && ws.meta) ws.meta.tx += bytes;
@@ -265,13 +271,13 @@ function recordTraffic(ws, dir, bytes) {
   if (tok) {
     let entry = tokenDeltas.get(tok);
     if (!entry) {
-      entry = { tx: 0, rx: 0, conns: 0, lastSeen: now };
+      entry = { tx: 0, rx: 0, conns: 0, lastSeen: approxNow };
       tokenDeltas.set(tok, entry);
       trimBoundedMap(tokenDeltas, RES.maxCacheEntries);
     }
     if (dir === 'tx') entry.tx += bytes;
     else entry.rx += bytes;
-    entry.lastSeen = now;
+    entry.lastSeen = approxNow;
   }
 }
 
@@ -699,6 +705,14 @@ function connectUpstreamTcp(id, tag, host, port, onConnect, onFail) {
           onFail(err);
         }
       });
+
+      socket.once('close', () => {
+        if (!connected && !destroyed) {
+          destroyed = true;
+          clearTimeout(connectTimer);
+          onFail(new Error('CONNECT_CLOSED'));
+        }
+      });
     })
     .catch((err) => {
       if (destroyed) return;
@@ -742,7 +756,8 @@ function pumpBidirectional(ws, sock, earlyPayload, pendingChunks, onTxBytes, onR
   let inflightWsSends = 0;
   let upstreamEnded = false;
   let closeCode = null;
-  let drainTimer = null;
+  let drainFallbackTimer = null;
+  let wsPaused = false;
   let finished = false;
 
   const tryCloseWs = () => {
@@ -755,18 +770,34 @@ function pumpBidirectional(ws, sock, earlyPayload, pendingChunks, onTxBytes, onR
     }
   };
 
+  const tryResumeSock = () => {
+    if (!wsPaused) return;
+    if (ws.readyState !== WebSocket.OPEN || ws.bufferedAmount < RES.wsLowWater) {
+      wsPaused = false;
+      if (drainFallbackTimer) {
+        clearTimeout(drainFallbackTimer);
+        drainFallbackTimer = null;
+      }
+      if (!sock.destroyed) sock.resume();
+    }
+  };
+
   const checkWsBackpressure = () => {
     if (ws.readyState !== WebSocket.OPEN) return;
-    if (ws.bufferedAmount > RES.wsHighWater) {
+    if (!wsPaused && ws.bufferedAmount > RES.wsHighWater) {
+      wsPaused = true;
       sock.pause();
-      if (!drainTimer) {
-        drainTimer = setInterval(() => {
-          if (ws.readyState !== WebSocket.OPEN || ws.bufferedAmount < RES.wsLowWater) {
-            clearInterval(drainTimer);
-            drainTimer = null;
-            if (!sock.destroyed) sock.resume();
+      if (ws._socket && !ws._socket.destroyed) {
+        ws._socket.once('drain', tryResumeSock);
+      }
+      if (!drainFallbackTimer) {
+        drainFallbackTimer = setTimeout(() => {
+          drainFallbackTimer = null;
+          tryResumeSock();
+          if (wsPaused && ws.readyState === WebSocket.OPEN && !sock.destroyed) {
+            drainFallbackTimer = setTimeout(tryResumeSock, 200);
           }
-        }, 15);
+        }, 200);
       }
     }
   };
@@ -790,6 +821,7 @@ function pumpBidirectional(ws, sock, earlyPayload, pendingChunks, onTxBytes, onR
   if (tcpSaturated) pauseWsReceiver(ws);
 
   ws.on('message', (data) => {
+    if (sock.destroyed || !sock.writable) return;
     const chunk = Buffer.isBuffer(data) ? data : Buffer.from(data);
     recordTraffic(ws, 'tx', chunk.length);
     if (onTxBytes) onTxBytes(chunk.length);
@@ -802,25 +834,25 @@ function pumpBidirectional(ws, sock, earlyPayload, pendingChunks, onTxBytes, onR
     if (ws.readyState === WebSocket.OPEN) resumeWsReceiver(ws);
   });
 
+  const onWsSendDone = () => {
+    inflightWsSends--;
+    if (wsPaused) tryResumeSock();
+    tryCloseWs();
+  };
+
   sock.on('data', (chunk) => {
     recordTraffic(ws, 'rx', chunk.length);
     if (onRxBytes) onRxBytes(chunk.length);
     if (ws.readyState !== WebSocket.OPEN) return;
 
-    if (chunk.length <= MAX_CHUNK) {
+    if (chunk.length <= WS_SEND_CHUNK) {
       inflightWsSends++;
-      ws.send(chunk, { binary: true }, () => {
-        inflightWsSends--;
-        tryCloseWs();
-      });
+      ws.send(chunk, { binary: true }, onWsSendDone);
     } else {
-      for (let offset = 0; offset < chunk.length; offset += MAX_CHUNK) {
-        const slice = chunk.subarray(offset, offset + MAX_CHUNK);
+      for (let offset = 0; offset < chunk.length; offset += WS_SEND_CHUNK) {
+        const slice = chunk.subarray(offset, offset + WS_SEND_CHUNK);
         inflightWsSends++;
-        ws.send(slice, { binary: true }, () => {
-          inflightWsSends--;
-          tryCloseWs();
-        });
+        ws.send(slice, { binary: true }, onWsSendDone);
       }
     }
     checkWsBackpressure();
@@ -829,9 +861,10 @@ function pumpBidirectional(ws, sock, earlyPayload, pendingChunks, onTxBytes, onR
   const cleanup = (who) => {
     if (finished) return;
     finished = true;
-    if (drainTimer) {
-      clearInterval(drainTimer);
-      drainTimer = null;
+    wsPaused = false;
+    if (drainFallbackTimer) {
+      clearTimeout(drainFallbackTimer);
+      drainFallbackTimer = null;
     }
     if (onFinish) onFinish(who);
   };
@@ -847,6 +880,11 @@ function pumpBidirectional(ws, sock, earlyPayload, pendingChunks, onTxBytes, onR
     cleanup('remote-close');
     upstreamEnded = true;
     tryCloseWs();
+  });
+
+  ws.on('error', () => {
+    cleanup('ws-error');
+    if (!sock.destroyed) sock.destroy();
   });
 
   ws.on('close', (code) => {
@@ -995,8 +1033,8 @@ function handleVlessMux(ws, id, version, initialPayload) {
   const sendMuxTcpData = (sessionId, data) => {
     if (closed || ws.readyState !== WebSocket.OPEN || !data || data.length === 0) return;
     recordTraffic(ws, 'rx', data.length);
-    for (let off = 0; off < data.length; off += MAX_CHUNK) {
-      const slice = data.subarray(off, off + MAX_CHUNK);
+    for (let off = 0; off < data.length; off += WS_SEND_CHUNK) {
+      const slice = data.subarray(off, off + WS_SEND_CHUNK);
       const frame = Buffer.allocUnsafe(8 + slice.length);
       frame.writeUInt16BE(4, 0);
       frame.writeUInt16BE(sessionId, 2);
@@ -1044,7 +1082,7 @@ function handleVlessMux(ws, id, version, initialPayload) {
     s.closed = true;
     sessions.delete(sessionId);
     if (s.drainTimer) {
-      clearInterval(s.drainTimer);
+      clearTimeout(s.drainTimer);
       s.drainTimer = null;
     }
     s.pending.length = 0;
@@ -1140,18 +1178,25 @@ function handleVlessMux(ws, id, version, initialPayload) {
         });
 
         sock.on('data', (chunk) => {
-          sess.lastActive = Date.now();
+          sess.lastActive = approxNow;
           sendMuxTcpData(sessionId, chunk);
           if (ws.bufferedAmount > RES.wsHighWater && !sock.destroyed) {
             sock.pause();
             if (!sess.drainTimer) {
-              sess.drainTimer = setInterval(() => {
+              const tryResumeMux = () => {
                 if (closed || sess.closed || sock.destroyed || ws.bufferedAmount < RES.wsLowWater) {
-                  clearInterval(sess.drainTimer);
+                  clearTimeout(sess.drainTimer);
                   sess.drainTimer = null;
                   if (!sock.destroyed && !closed && !sess.closed) sock.resume();
+                } else {
+                  sess.drainTimer = setTimeout(tryResumeMux, 150);
+                  sess.drainTimer.unref();
                 }
-              }, 20);
+              };
+              if (ws._socket && !ws._socket.destroyed) {
+                ws._socket.once('drain', tryResumeMux);
+              }
+              sess.drainTimer = setTimeout(tryResumeMux, 150);
               sess.drainTimer.unref();
             }
           }
@@ -1508,8 +1553,10 @@ function parseUpgradeUrl(rawUrl) {
   return { pathname, token };
 }
 
+let registerInFlight = false;
 function registerRenderHost() {
-  if (!PUBLIC_HOST) return;
+  if (!PUBLIC_HOST || registerInFlight) return;
+  registerInFlight = true;
   const payload = JSON.stringify({
     host: PUBLIC_HOST,
     port: PUBLIC_PORT,
@@ -1531,6 +1578,7 @@ function registerRenderHost() {
     },
     (res) => {
       res.resume();
+      registerInFlight = false;
       if (res.statusCode === 200) {
         registered = true;
         log('SYS', null, `Registered ${PUBLIC_HOST}:${PUBLIC_PORT} with Worker`);
@@ -1540,8 +1588,8 @@ function registerRenderHost() {
       }
     }
   );
-  req.on('error', (err) => log('ERR', null, `Worker registration error: ${err.message}`));
-  req.on('timeout', () => { req.destroy(); });
+  req.on('error', (err) => { registerInFlight = false; log('ERR', null, `Worker registration error: ${err.message}`); });
+  req.on('timeout', () => { registerInFlight = false; req.destroy(); });
   req.write(payload);
   req.end();
 }
@@ -1667,6 +1715,8 @@ const httpServer = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('OK\n');
 });
+httpServer.headersTimeout = 10000;
+httpServer.requestTimeout = 15000;
 
 httpServer.on('connection', (socket) => {
   socket.setNoDelay(true);
@@ -1678,7 +1728,7 @@ httpServer.on('upgrade', async (request, socket, head) => {
   socket.on('error', () => socket.destroy());
   socket.setNoDelay(true);
 
-  if (memoryPressureActive || checkMemoryPressure() || wss.clients.size >= MAX_TOTAL_CONNS) {
+  if (memoryPressureActive || wss.clients.size >= MAX_TOTAL_CONNS) {
     if (socket.writable) socket.write('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n');
     return socket.destroy();
   }
@@ -1698,7 +1748,7 @@ httpServer.on('upgrade', async (request, socket, head) => {
     return socket.destroy();
   }
 
-  if (memoryPressureActive || checkMemoryPressure() || wss.clients.size >= MAX_TOTAL_CONNS) {
+  if (memoryPressureActive || wss.clients.size >= MAX_TOTAL_CONNS) {
     socket.write('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n');
     return socket.destroy();
   }
