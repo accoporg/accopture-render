@@ -1,0 +1,14 @@
+{
+  "name": "accopture-render",
+  "version": "1.6.2",
+  "private": true,
+  "description": "Edge-TLS VLESS-over-WebSocket relay for Render (connect.accopture.top)",
+  "main": "render.js",
+  "scripts": {
+    "start": "node render.js",
+    "start:render": "node render.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
